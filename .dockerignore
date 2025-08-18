@@ -1,0 +1,70 @@
+# This file specifies files and directories to ignore in the Docker context.
+documents/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Git
+.git/
+.gitignore
+
+# Temporary files
+*.tmp
+*.log
+/tmp/
+
+# Test outputs
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Jupyter
+.ipynb_checkpoints
+
+# Large individual files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.tar

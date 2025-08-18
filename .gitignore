@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model caches and weights
+*-cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+weights-cache/
+sdxl-lora-cache/
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cog specific
+.cog/
+
+# Test outputs
+test_outputs/
+*.png
+*.jpg
+*.jpeg
+
+# Environment variables
+.env.local
+.env.development
+.env.production
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints
+
+# Test folder and documentation (keep out of main repo)
+test_folder/
+documents/
+local-models/
+
+# Development artifacts
+simple_test_*.png
+illustrious_test_*.png
+out-*.png
+out-*.jpg
+out-*.webp
