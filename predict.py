@@ -40,7 +40,6 @@ from utils import (
     SDXL_MODEL_CACHE,
     REFINER_MODEL_CACHE,
     SAFETY_CACHE,
-    FEATURE_EXTRACTOR,
     SDXL_URL,
     REFINER_URL,
     SAFETY_URL
@@ -203,7 +202,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
                 SAFETY_CACHE, torch_dtype=torch.float16
             ).to(self.device)
-            self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
+            self.feature_extractor = CLIPImageProcessor.from_pretrained(SAFETY_CACHE)
             print("✅ Safety checker loaded successfully")
         except Exception as e:
             print(f"⚠️  Failed to load safety checker: {e}")
@@ -219,39 +218,48 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             SDXL_MODEL_CACHE,
             torch_dtype=torch.float16,
             use_safetensors=True,
-            variant="fp16",
         )
         self.txt2img_pipe.to(self.device)
         
         # Store original UNet for model switching
         self.original_unet = self.txt2img_pipe.unet
         
-        # Load Illustrious XL UNet as default (pre-downloaded during build)
+        # Load Illustrious XL UNet as default model
         try:
             print("Loading Illustrious XL UNet as default model...")
-            illustrious_path = "/src/illustrious-xl-unet/illustrious-xl.safetensors"
-            if os.path.exists(illustrious_path):
-                from diffusers import UNet2DConditionModel
-                illustrious_unet = UNet2DConditionModel.from_single_file(
-                    illustrious_path,
-                    torch_dtype=torch.float16,
-                    use_safetensors=True,
-                ).to(self.device)
-                self.txt2img_pipe.unet = illustrious_unet
-                self.current_model = "illustrious-xl"
-                print("✅ Illustrious XL loaded as default model (pre-cached)")
-            else:
-                print("⚠️  Illustrious XL not found at build path, downloading...")
+            
+            # Try multiple paths: pre-cached, local download, then fallback
+            illustrious_paths_to_try = [
+                "/src/illustrious-xl-unet/illustrious-xl.safetensors",  # Pre-cached during build
+                "/src/custom-models/illustrious-xl-unet.safetensors",  # Alternative pre-cache location
+            ]
+            
+            illustrious_path = None
+            for path in illustrious_paths_to_try:
+                if os.path.exists(path):
+                    illustrious_path = path
+                    print(f"Found pre-cached Illustrious XL at: {path}")
+                    break
+            
+            # If not found, download it
+            if not illustrious_path:
+                print("Illustrious XL not found in cache, downloading...")
                 illustrious_path = download_custom_model_local("illustrious-xl")
-                from diffusers import UNet2DConditionModel
-                illustrious_unet = UNet2DConditionModel.from_single_file(
-                    illustrious_path,
-                    torch_dtype=torch.float16,
-                    use_safetensors=True,
-                ).to(self.device)
-                self.txt2img_pipe.unet = illustrious_unet
-                self.current_model = "illustrious-xl"
-                print("✅ Illustrious XL loaded as default model (downloaded)")
+                print(f"Downloaded Illustrious XL to: {illustrious_path}")
+            
+            # Load the UNet model
+            from diffusers import UNet2DConditionModel
+            illustrious_unet = UNet2DConditionModel.from_single_file(
+                illustrious_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+            ).to(self.device)
+            
+            # Replace the UNet in the pipeline
+            self.txt2img_pipe.unet = illustrious_unet
+            self.current_model = "illustrious-xl"
+            print("✅ Illustrious XL loaded as default model")
+            
         except Exception as e:
             print(f"⚠️  Failed to load Illustrious XL: {e}")
             print("⚠️  Using standard SDXL as fallback")
@@ -291,7 +299,6 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             vae=self.txt2img_pipe.vae,
             torch_dtype=torch.float16,
             use_safetensors=True,
-            variant="fp16",
         )
         self.refiner.to(self.device)
         print(f"Setup completed in {time.time() - start:.2f}s")
@@ -471,7 +478,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         ),
         apply_watermark: bool = Input(
             description="Apply watermark to generated images",
-            default=True,
+            default=False,
         ),
         
         # Model selection (Illustrious XL is loaded by default)
@@ -487,7 +494,6 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         print(f"Using seed: {seed}")
         
         # Parse dimensions from aspect ratio and megapixels
-        print(f"Debug: image parameter = {repr(image)}")
         if image:
             # If input image provided, load it to get dimensions
             input_image = load_image(image).convert("RGB")

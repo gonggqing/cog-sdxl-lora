@@ -228,7 +228,7 @@ def download_safetensors_tarball(url: str, path: Path):
 
         try:
             subprocess.run(
-                ["pget", "--log-level=WARNING", "-x", url, extract_dir], check=True
+                ["pget", "-v", "-x", url, extract_dir], check=True
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to download tarball: {e}")

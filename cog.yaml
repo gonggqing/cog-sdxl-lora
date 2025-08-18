@@ -8,7 +8,4 @@ build:
   python_requirements: "requirements.txt"
   run:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/download/v0.8.2/pget_linux_x86_64" && chmod +x /usr/local/bin/pget
-    - mkdir -p /src/illustrious-xl-unet
-    - wget "https://huggingface.co/drawhisper/illustrious-xl/resolve/main/illustrious-xl.safetensors" -O "/src/illustrious-xl-unet/illustrious-xl.safetensors"
-
 predict: "predict.py:Predictor"

@@ -365,10 +365,14 @@ def check_gpu_memory() -> Dict[str, Any]:
             info["device_name"] = "Apple Silicon GPU"
             
             # MPS doesn't have direct memory query, estimate based on system
-            import psutil
-            # Apple Silicon uses unified memory
-            total_memory = psutil.virtual_memory().total
-            info["total_memory"] = total_memory // 2  # Rough estimate for GPU portion
+            try:
+                import psutil
+                # Apple Silicon uses unified memory
+                total_memory = psutil.virtual_memory().total
+                info["total_memory"] = total_memory // 2  # Rough estimate for GPU portion
+            except ImportError:
+                # psutil not available, use default estimate
+                info["total_memory"] = 8 * 1024**3  # 8GB default estimate
             
             # MPS memory tracking (if available)
             if hasattr(torch.mps, 'current_allocated_memory'):
@@ -579,7 +583,6 @@ def get_output_format_extension(output_format: str) -> str:
 SDXL_MODEL_CACHE = "./sdxl-cache"
 REFINER_MODEL_CACHE = "./refiner-cache"
 SAFETY_CACHE = "./safety-cache"
-FEATURE_EXTRACTOR = "./feature-extractor"
 
 # Model download URLs
 SDXL_URL = "https://weights.replicate.delivery/default/sdxl/sdxl-vae-fix-1.0.tar"
@@ -659,7 +662,6 @@ def download_custom_model_local(model_name: str, cache_dir: str = "./custom-mode
                         print(f"Attempt {attempt + 1}/{max_retries}: Downloading with pget...")
                         subprocess.check_call([
                             "pget", 
-                            "--timeout", "300",  # 5 minute timeout
                             config["url"], 
                             model_path
                         ])
