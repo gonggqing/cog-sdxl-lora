@@ -1,5 +1,4 @@
 import os
-import shutil
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -320,10 +319,6 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             print("Note: Illustrious XL should already be the default model")
             self.current_model = "illustrious-xl"
 
-    def load_image(self, path):
-        shutil.copyfile(path, "/tmp/image.png")
-        return load_image("/tmp/image.png").convert("RGB")
-
     def run_safety_checker(self, image):
         if self.safety_checker is None or self.feature_extractor is None:
             # Safety checker not available, return images as-is with no NSFW flags
@@ -369,8 +364,8 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             le=100,
             default=80,
         ),
-        image: Optional[str] = Input(
-            description="Input image for image-to-image mode. The aspect ratio of your output will match this image",
+        image: Optional[Path] = Input(
+            description="Input image for image-to-image mode (supports PNG, JPG, WEBP).",
             default=None,
         ),
         prompt_strength: float = Input(
@@ -493,18 +488,16 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
         
-        # Parse dimensions from aspect ratio and megapixels
+        # Parse dimensions from aspect ratio and megapixels (always use user settings)
+        width, height = parse_aspect_ratio(aspect_ratio, megapixels)
+        width, height = validate_dimensions(width, height)
+        print(f"Using aspect ratio {aspect_ratio} -> {width}x{height}")
+        
+        # Load input image if provided (for img2img mode)
         if image:
-            # If input image provided, load it to get dimensions
             input_image = load_image(image).convert("RGB")
-            width, height = input_image.size
-            width, height = validate_dimensions(width, height)
-            print(f"Using image dimensions: {width}x{height}")
-        else:
-            # Parse aspect ratio and megapixels
-            width, height = parse_aspect_ratio(aspect_ratio, megapixels)
-            width, height = validate_dimensions(width, height)
-            print(f"Using aspect ratio {aspect_ratio} -> {width}x{height}")
+            print(f"Input image loaded with dimensions: {input_image.size[0]}x{input_image.size[1]}")
+            print(f"Output will be resized to: {width}x{height}")
         
         # Apply go_fast optimizations
         if go_fast:
