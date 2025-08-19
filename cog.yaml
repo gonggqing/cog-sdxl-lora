@@ -1,6 +1,6 @@
 build:
   gpu: true
-  python_version: "3.12"
+  python_version: "3.11"
   system_packages:
     - "libgl1-mesa-dev"
     - "libglib2.0-0"

@@ -20,14 +20,14 @@ from diffusers.models.attention_processor import LoRAAttnProcessor2_0
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
-from diffusers.utils import load_image
 from transformers import CLIPImageProcessor
 
 from weights import SDXLLoRACache
 from utils import (
     download_weights,
     TokenEmbeddingsHandler,
-    load_lora_weights_to_unet,
+    load_lora_weights_to_pipeline,
+    unload_lora_weights_from_pipeline,
     merge_lora_weights,
     validate_lora_file,
     log_system_info,
@@ -35,6 +35,7 @@ from utils import (
     validate_dimensions,
     get_output_format_extension,
     get_model_config_local,
+    load_image,
     download_custom_model_local,
     SDXL_MODEL_CACHE,
     REFINER_MODEL_CACHE,
@@ -70,6 +71,12 @@ class MultiLoRAMixin:
         self.lora_cache = SDXLLoRACache()
         self.loaded_loras = []  # Track loaded LoRAs for cleanup
         self.original_attn_processors = None  # Store original processors
+        
+        # State tracking for smart caching (inspired by cog-flux)
+        self.current_lora = None
+        self.current_lora_scale = None
+        self.current_extra_lora = None
+        self.current_extra_lora_scale = None
     
     def load_single_lora(
         self, 
@@ -90,8 +97,8 @@ class MultiLoRAMixin:
             civitai_api_token=civitai_api_token
         )
         
-        # Load LoRA using the existing method from the original predictor
-        self._apply_lora_to_unet(pipe.unet, lora_path, lora_scale)
+        # Load LoRA using the new pipeline-level method
+        self._apply_lora_to_pipeline(pipe, lora_path, lora_scale, adapter_name="main_lora")
         self.loaded_loras = [{"path": lora_path, "scale": lora_scale}]
         
         print(f"Single LoRA loaded in {time.time() - start_time:.2f}s")
@@ -135,44 +142,186 @@ class MultiLoRAMixin:
             self.original_attn_processors = pipe.unet.attn_processors.copy()
         
         # Apply multiple LoRAs
-        self._apply_multiple_loras_to_unet(pipe.unet, loras_to_load)
+        self._apply_multiple_loras_to_pipeline(pipe, loras_to_load)
         self.loaded_loras = loras_to_load
         
         print(f"Multiple LoRAs loaded in {time.time() - start_time:.2f}s")
     
-    def _apply_lora_to_unet(self, unet, lora_path: Path, lora_scale: float):
-        """Apply a single LoRA to the UNet using utilities."""
+    def _apply_lora_to_pipeline(self, pipeline, lora_path: Path, lora_scale: float, adapter_name: str = "default"):
+        """Apply a single LoRA to the pipeline using diffusers' built-in functionality."""
         # Validate LoRA file first
         if not validate_lora_file(lora_path):
             raise ValueError(f"Invalid LoRA file: {lora_path}")
         
-        # Use the utility function to load LoRA weights
-        load_lora_weights_to_unet(unet, lora_path, device=self.device)
+        # Use the utility function to load LoRA weights to the pipeline
+        load_lora_weights_to_pipeline(pipeline, lora_path, adapter_name=adapter_name, lora_scale=lora_scale)
     
-    def _apply_multiple_loras_to_unet(self, unet, loras: List[Dict]):
+    def _apply_multiple_loras_to_pipeline(self, pipeline, loras: List[Dict]):
         """
-        Apply multiple LoRAs to UNet by merging their weights.
-        This is a simplified approach - in production, you might want more sophisticated merging.
+        Apply multiple LoRAs to pipeline using diffusers' built-in functionality.
+        Supports maximum of 2 LoRAs to be merged together.
         """
         if not loras:
             return
+            
+        # Enforce maximum of 2 LoRAs
+        if len(loras) > 2:
+            raise ValueError(f"Maximum of 2 LoRAs supported, but {len(loras)} were provided. Only main and extra LoRA are allowed.")
         
-        # For simplicity, we'll apply the first LoRA normally and then merge additional ones
-        # This is a basic implementation - flux uses more advanced merging techniques
-        first_lora = loras[0]
-        self._apply_lora_to_unet(unet, first_lora["path"], first_lora["scale"])
+        print(f"Applying {len(loras)} LoRA(s) to pipeline...")
         
-        # For additional LoRAs, we would need more sophisticated merging
-        # This is a placeholder for the enhanced logic you might implement
-        if len(loras) > 1:
-            print(f"Note: Currently applying primary LoRA only. Additional LoRA merging would require enhanced implementation.")
+        # Load each LoRA as a separate adapter
+        adapter_names = []
+        adapter_weights = []
+        
+        for i, lora in enumerate(loras):
+            # Use descriptive names for the two LoRAs
+            adapter_name = "main_lora" if i == 0 else "extra_lora"
+            adapter_names.append(adapter_name)
+            adapter_weights.append(lora["scale"])
+            
+            # Load this LoRA as a separate adapter
+            self._apply_lora_to_pipeline(pipeline, lora["path"], 1.0, adapter_name=adapter_name)
+        
+        # Set all adapters with their respective weights
+        try:
+            pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
+            print(f"✅ Successfully applied {len(loras)} LoRAs with weights: {adapter_weights}")
+        except Exception as e:
+            print(f"⚠️ Failed to set multiple adapter weights: {e}")
+            print("   Using first LoRA only as fallback")
+            # Fallback to using just the first LoRA
+            if adapter_names:
+                pipeline.set_adapters([adapter_names[0]], adapter_weights=[adapter_weights[0]])
     
     def unload_loras(self, pipe):
-        """Unload all LoRAs and restore original attention processors."""
-        if self.original_attn_processors is not None:
-            pipe.unet.set_attn_processor(self.original_attn_processors)
-            print("Unloaded all LoRAs and restored original attention processors")
+        """Unload all LoRAs using diffusers' built-in functionality."""
+        try:
+            # Try to unload using the new pipeline-level approach
+            if hasattr(pipe, 'delete_adapters') and self.loaded_loras:
+                # Get all adapter names that might be loaded based on number of LoRAs
+                adapter_names = []
+                if len(self.loaded_loras) == 1:
+                    adapter_names = ["main_lora"]
+                elif len(self.loaded_loras) == 2:
+                    adapter_names = ["main_lora", "extra_lora"]
+                
+                for adapter_name in adapter_names:
+                    try:
+                        pipe.delete_adapters([adapter_name])
+                        print(f"✅ Deleted adapter: {adapter_name}")
+                    except Exception as e:
+                        print(f"⚠️ Could not delete adapter {adapter_name}: {e}")
+                        
+                print("✅ LoRAs unloaded using pipeline adapters")
+                
+            elif hasattr(pipe, 'unfuse_lora'):
+                pipe.unfuse_lora()
+                print("✅ LoRAs unfused from pipeline")
+                
+            else:
+                # Fallback to manual restoration if available
+                if self.original_attn_processors is not None:
+                    pipe.unet.set_attn_processor(self.original_attn_processors)
+                    print("✅ LoRAs unloaded using manual processor restoration")
+                else:
+                    print("⚠️ No method available to unload LoRAs")
+                    
+        except Exception as e:
+            print(f"⚠️ Failed to unload LoRAs: {e}")
+            # Try fallback method
+            if self.original_attn_processors is not None:
+                try:
+                    pipe.unet.set_attn_processor(self.original_attn_processors)
+                    print("✅ LoRAs unloaded using fallback method")
+                except Exception as e2:
+                    print(f"❌ Failed to unload LoRAs even with fallback: {e2}")
+        
+        # Reset state
+        self.original_attn_processors = None
         self.loaded_loras = []
+        self.current_lora = None
+        self.current_lora_scale = None
+        self.current_extra_lora = None
+        self.current_extra_lora_scale = None
+
+    def handle_loras(
+        self,
+        pipeline,
+        lora_weights: str | None = None,
+        lora_scale: float = 1.0,
+        extra_lora_weights: str | None = None,
+        extra_lora_scale: float = 1.0,
+        hf_api_token: Optional[Secret] = None,
+        civitai_api_token: Optional[Secret] = None,
+    ):
+        """
+        Smart LoRA loading inspired by cog-flux handle_loras method.
+        Only reloads LoRAs if weights or scales have actually changed.
+        """
+        # Handle edge case: extra_lora provided without main lora
+        if not lora_weights and extra_lora_weights:
+            print(f"⚠️ extra_lora_weights {extra_lora_weights} found but lora_weights is None!")
+            print(f"   Setting main LoRA to {extra_lora_weights} with scale {extra_lora_scale}")
+            lora_weights = extra_lora_weights
+            lora_scale = extra_lora_scale
+            extra_lora_weights = None
+            extra_lora_scale = 1.0
+
+        # Check if we need to reload (smart caching)
+        needs_reload = (
+            lora_weights != self.current_lora
+            or lora_scale != self.current_lora_scale
+            or extra_lora_weights != self.current_extra_lora
+            or extra_lora_scale != self.current_extra_lora_scale
+        )
+
+        if lora_weights and needs_reload:
+            print("🔄 LoRA configuration changed, reloading...")
+            
+            # Unload existing LoRAs first
+            if self.current_lora or self.current_extra_lora:
+                self.unload_loras(pipeline)
+
+            # Load new LoRAs
+            if extra_lora_weights:
+                # Load multiple LoRAs
+                print(f"📦 Loading multiple LoRAs: main={lora_weights}, extra={extra_lora_weights}")
+                self.load_multiple_loras(
+                    pipeline,
+                    main_lora_url=lora_weights,
+                    main_lora_scale=lora_scale,
+                    extra_lora_url=extra_lora_weights,
+                    extra_lora_scale=extra_lora_scale,
+                    hf_api_token=hf_api_token,
+                    civitai_api_token=civitai_api_token,
+                )
+            else:
+                # Load single LoRA
+                print(f"📦 Loading single LoRA: {lora_weights}")
+                self.load_single_lora(
+                    pipeline,
+                    lora_url=lora_weights,
+                    lora_scale=lora_scale,
+                    hf_api_token=hf_api_token,
+                    civitai_api_token=civitai_api_token,
+                )
+                
+        elif lora_weights and not needs_reload:
+            print(f"✅ LoRA {lora_weights} already loaded")
+            if extra_lora_weights:
+                print(f"✅ Extra LoRA {extra_lora_weights} already loaded")
+                
+        elif not lora_weights and self.current_lora:
+            # No LoRAs requested but some are loaded - unload them
+            print("🔄 No LoRAs requested, unloading existing LoRAs...")
+            self.unload_loras(pipeline)
+
+        # Update current state
+        self.current_lora = lora_weights
+        self.current_lora_scale = lora_scale
+        self.current_extra_lora = extra_lora_weights
+        self.current_extra_lora_scale = extra_lora_scale
 
 
 class Predictor(BasePredictor, MultiLoRAMixin):
@@ -201,7 +350,8 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
                 SAFETY_CACHE, torch_dtype=torch.float16
             ).to(self.device)
-            self.feature_extractor = CLIPImageProcessor.from_pretrained(SAFETY_CACHE)
+            # Use the standard feature extractor for safety checking
+            self.feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
             print("✅ Safety checker loaded successfully")
         except Exception as e:
             print(f"⚠️  Failed to load safety checker: {e}")
@@ -209,45 +359,47 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             self.safety_checker = None
             self.feature_extractor = None
 
-        if not os.path.exists(SDXL_MODEL_CACHE):
-            download_weights(SDXL_URL, SDXL_MODEL_CACHE)
-
-        print("Loading SDXL txt2img pipeline...")
-        self.txt2img_pipe = DiffusionPipeline.from_pretrained(
-            SDXL_MODEL_CACHE,
-            torch_dtype=torch.float16,
-            use_safetensors=True,
-        )
-        self.txt2img_pipe.to(self.device)
-        
-        # Store original UNet for model switching
-        self.original_unet = self.txt2img_pipe.unet
-        
-        # Load Illustrious XL UNet as default model
+        # Try to load Illustrious XL as complete pipeline first
         try:
-            print("Loading Illustrious XL UNet as default model...")
+            print("Loading Illustrious XL complete model...")
             
-            # Use the enhanced download function that handles HF cache, pre-cache, and fallbacks
+            # Download the complete Illustrious XL model
             illustrious_path = download_custom_model_local("illustrious-xl")
-            print(f"Illustrious XL model located at: {illustrious_path}")
+            print(f"Illustrious XL path: {illustrious_path}")
             
-            # Load the UNet model
-            from diffusers import UNet2DConditionModel
-            illustrious_unet = UNet2DConditionModel.from_single_file(
+            from diffusers import StableDiffusionXLPipeline
+            
+            # Load Illustrious XL as complete pipeline (has all components)
+            self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
                 illustrious_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                local_files_only=True,  # Use cached files
+            ).to(self.device)
+            
+            self.current_model = "illustrious-xl"
+            print("✅ Illustrious XL complete model loaded successfully")
+            
+        except Exception as e:
+            print(f"⚠️  Failed to load Illustrious XL: {e}")
+            print("⚠️  Falling back to standard SDXL...")
+            
+            # Fallback: Load SDXL base pipeline
+            if not os.path.exists(SDXL_MODEL_CACHE):
+                download_weights(SDXL_URL, SDXL_MODEL_CACHE)
+            
+            print("Loading SDXL base pipeline as fallback...")
+            self.txt2img_pipe = DiffusionPipeline.from_pretrained(
+                SDXL_MODEL_CACHE,
                 torch_dtype=torch.float16,
                 use_safetensors=True,
             ).to(self.device)
             
-            # Replace the UNet in the pipeline
-            self.txt2img_pipe.unet = illustrious_unet
-            self.current_model = "illustrious-xl"
-            print("✅ Illustrious XL loaded as default model")
-            
-        except Exception as e:
-            print(f"⚠️  Failed to load Illustrious XL: {e}")
-            print("⚠️  Using standard SDXL as fallback")
             self.current_model = "sdxl-base"
+            print("✅ SDXL fallback model loaded")
+        
+        # Store original UNet for model switching (either Illustrious XL or SDXL)
+        self.original_unet = self.txt2img_pipe.unet
 
         print("Loading SDXL img2img pipeline...")
         self.img2img_pipe = StableDiffusionXLImg2ImgPipeline(
@@ -288,21 +440,91 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         print(f"Setup completed in {time.time() - start:.2f}s")
 
     def switch_to_standard_sdxl(self):
-        """Switch to standard SDXL UNet for realistic content."""
+        """Switch to standard SDXL for realistic content."""
         if self.current_model != "sdxl-base":
-            print("Switching to standard SDXL UNet...")
-            self.txt2img_pipe.unet = self.original_unet
-            self.img2img_pipe.unet = self.original_unet
-            self.inpaint_pipe.unet = self.original_unet
-            self.current_model = "sdxl-base"
-            print("✅ Using standard SDXL")
+            print("Switching to standard SDXL...")
+            
+            # If current model is Illustrious XL, we need to load SDXL
+            if self.current_model == "illustrious-xl":
+                try:
+                    # Load standard SDXL pipeline
+                    self.txt2img_pipe = DiffusionPipeline.from_pretrained(
+                        SDXL_MODEL_CACHE,
+                        torch_dtype=torch.float16,
+                        use_safetensors=True,
+                    ).to(self.device)
+                    
+                    # Update other pipelines to use SDXL components
+                    self.img2img_pipe = StableDiffusionXLImg2ImgPipeline(
+                        vae=self.txt2img_pipe.vae,
+                        text_encoder=self.txt2img_pipe.text_encoder,
+                        text_encoder_2=self.txt2img_pipe.text_encoder_2,
+                        tokenizer=self.txt2img_pipe.tokenizer,
+                        tokenizer_2=self.txt2img_pipe.tokenizer_2,
+                        unet=self.txt2img_pipe.unet,
+                        scheduler=self.txt2img_pipe.scheduler,
+                    ).to(self.device)
+                    
+                    self.inpaint_pipe = StableDiffusionXLInpaintPipeline(
+                        vae=self.txt2img_pipe.vae,
+                        text_encoder=self.txt2img_pipe.text_encoder,
+                        text_encoder_2=self.txt2img_pipe.text_encoder_2,
+                        tokenizer=self.txt2img_pipe.tokenizer,
+                        tokenizer_2=self.txt2img_pipe.tokenizer_2,
+                        unet=self.txt2img_pipe.unet,
+                        scheduler=self.txt2img_pipe.scheduler,
+                    ).to(self.device)
+                    
+                    self.current_model = "sdxl-base"
+                    print("✅ Switched to standard SDXL")
+                    
+                except Exception as e:
+                    print(f"⚠️  Failed to switch to SDXL: {e}")
             
     def switch_to_illustrious_xl(self):
-        """Switch back to Illustrious XL UNet (default)."""
+        """Switch back to Illustrious XL (default)."""
         if self.current_model != "illustrious-xl":
-            # This should not normally happen since Illustrious XL is loaded by default
-            print("Note: Illustrious XL should already be the default model")
-            self.current_model = "illustrious-xl"
+            print("Switching back to Illustrious XL...")
+            
+            try:
+                from diffusers import StableDiffusionXLPipeline
+
+                illustrious_cache = download_custom_model_local("illustrious-xl")
+                
+                # Load Illustrious XL pipeline
+                self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
+                    illustrious_cache,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True,
+                    local_files_only=True,  # Force using local files since we've cached them
+                ).to(self.device)
+                
+                # Update other pipelines to use Illustrious XL components
+                self.img2img_pipe = StableDiffusionXLImg2ImgPipeline(
+                    vae=self.txt2img_pipe.vae,
+                    text_encoder=self.txt2img_pipe.text_encoder,
+                    text_encoder_2=self.txt2img_pipe.text_encoder_2,
+                    tokenizer=self.txt2img_pipe.tokenizer,
+                    tokenizer_2=self.txt2img_pipe.tokenizer_2,
+                    unet=self.txt2img_pipe.unet,
+                    scheduler=self.txt2img_pipe.scheduler,
+                ).to(self.device)
+                
+                self.inpaint_pipe = StableDiffusionXLInpaintPipeline(
+                    vae=self.txt2img_pipe.vae,
+                    text_encoder=self.txt2img_pipe.text_encoder,
+                    text_encoder_2=self.txt2img_pipe.text_encoder_2,
+                    tokenizer=self.txt2img_pipe.tokenizer,
+                    tokenizer_2=self.txt2img_pipe.tokenizer_2,
+                    unet=self.txt2img_pipe.unet,
+                    scheduler=self.txt2img_pipe.scheduler,
+                ).to(self.device)
+                
+                self.current_model = "illustrious-xl"
+                print("✅ Switched to Illustrious XL")
+                
+            except Exception as e:
+                print(f"⚠️  Failed to switch to Illustrious XL: {e}")
 
     def run_safety_checker(self, image):
         if self.safety_checker is None or self.feature_extractor is None:
@@ -325,7 +547,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         # Core flux-compatible parameters
         prompt: str = Input(
             description="Text prompt for image generation",
-            default="An astronaut riding a rainbow unicorn",
+            default="1girl, solo, ranni_the_witch, elden_ring, looking_at_viewer, witch_hat, blue_skin, doll_joints",
         ),
         num_outputs: int = Input(
             description="Number of images to generate",
@@ -433,18 +655,18 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             description="Classifier-free guidance scale (same as guidance, kept for SDXL compatibility)",
             ge=1.0,
             le=20.0,
-            default=7.5,
+            default=4.5,
         ),
         clip_skip: int = Input(
             description="Number of CLIP layers to skip (advanced parameter)",
             ge=0,
             le=2,
-            default=0,
+            default=1,
         ),
         refine: str = Input(
             description="Which refine style to use",
             choices=["no_refiner", "expert_ensemble_refiner", "base_image_refiner"],
-            default="no_refiner",
+            default="base_image_refiner",
         ),
         high_noise_frac: float = Input(
             description="For expert_ensemble_refiner, the fraction of noise to use",
@@ -454,7 +676,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         ),
         refine_steps: int = Input(
             description="For base_image_refiner, the number of steps to refine",
-            default=None,
+            default=5,
         ),
         apply_watermark: bool = Input(
             description="Apply watermark to generated images",
@@ -517,31 +739,16 @@ class Predictor(BasePredictor, MultiLoRAMixin):
                 negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry"
                 print("Applied Illustrious XL optimized negative prompt")
         
-        # Load LoRAs if specified (support both flux parameter names)
-        lora_url = lora_weights or None  # Use lora_weights (flux-style) if provided
-        extra_lora_url = extra_lora or None  # Use extra_lora (flux-style) if provided
-        
-        if lora_url:
-            if extra_lora_url:
-                # Load multiple LoRAs
-                self.load_multiple_loras(
-                    self.txt2img_pipe,
-                    main_lora_url=lora_url,
-                    main_lora_scale=lora_scale,
-                    extra_lora_url=extra_lora_url,
-                    extra_lora_scale=extra_lora_scale,
-                    hf_api_token=hf_token,
-                    civitai_api_token=civitai_token,
-                )
-            else:
-                # Load single LoRA
-                self.load_single_lora(
-                    self.txt2img_pipe,
-                    lora_url=lora_url,
-                    lora_scale=lora_scale,
-                    hf_api_token=hf_token,
-                    civitai_api_token=civitai_token,
-                )
+        # Handle LoRAs using smart caching (inspired by cog-flux)
+        self.handle_loras(
+            self.txt2img_pipe,
+            lora_weights=lora_weights,
+            lora_scale=lora_scale,
+            extra_lora_weights=extra_lora,
+            extra_lora_scale=extra_lora_scale,
+            hf_api_token=hf_token,
+            civitai_api_token=civitai_token,
+        )
         
         print(f"Prompt: {prompt}")
         print(f"Negative prompt: {negative_prompt}")

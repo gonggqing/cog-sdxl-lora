@@ -9,6 +9,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from io import BytesIO
+import requests
 
 import torch
 
@@ -16,9 +18,135 @@ import torch
 try:
     from diffusers.models.attention_processor import LoRAAttnProcessor2_0
     from safetensors.torch import load_file
+    from PIL import Image
     ML_LIBRARIES_AVAILABLE = True
 except ImportError:
     ML_LIBRARIES_AVAILABLE = False
+
+
+def load_image(image):
+    """
+    Load an image from various sources including URLs, local paths, PIL Images, and Replicate blob data.
+    
+    Args:
+        image: Can be:
+            - URL (str) starting with http:// or https://
+            - Local file path (str or Path)
+            - PIL Image object
+            - Bytes or file-like object (from Replicate)
+            - Cog Input object (from Replicate)
+    
+    Returns:
+        PIL.Image: Loaded PIL Image object
+    
+    Raises:
+        ValueError: If the image format is not supported or cannot be loaded
+    """
+    if not ML_LIBRARIES_AVAILABLE:
+        raise RuntimeError("PIL is required for image loading. Install requirements.txt dependencies.")
+    
+    try:
+        # Case 1: Already a PIL Image
+        if hasattr(image, 'mode') and hasattr(image, 'size'):
+            return image
+        
+        # Case 2: String URL or path
+        if isinstance(image, str):
+            if image.startswith(('http://', 'https://')):
+                # Download from URL
+                print(f"Loading image from URL: {image}")
+                response = requests.get(image, stream=True, timeout=30)
+                response.raise_for_status()
+                return Image.open(BytesIO(response.content))
+            else:
+                # Local file path
+                print(f"Loading image from local path: {image}")
+                if not os.path.exists(image):
+                    raise ValueError(f"Image file not found: {image}")
+                return Image.open(image)
+        
+        # Case 3: Bytes data
+        if isinstance(image, bytes):
+            print("Loading image from bytes data")
+            return Image.open(BytesIO(image))
+        
+        # Case 4: File-like object (has read method)
+        if hasattr(image, 'read'):
+            print("Loading image from file-like object")
+            # If it's a file-like object, read its content
+            if hasattr(image, 'seek'):
+                image.seek(0)  # Reset to beginning
+            data = image.read()
+            if isinstance(data, bytes):
+                return Image.open(BytesIO(data))
+            else:
+                raise ValueError("File-like object did not return bytes")
+        
+        # Case 5: Cog Input object (Replicate specific)
+        if hasattr(image, 'url'):
+            # Cog Input objects have a url attribute
+            print(f"Loading image from Cog Input URL: {image.url}")
+            response = requests.get(image.url, stream=True, timeout=30)
+            response.raise_for_status()
+            return Image.open(BytesIO(response.content))
+        
+        # Case 6: Try to convert to bytes if it has a buffer interface
+        try:
+            if hasattr(image, '__bytes__'):
+                data = bytes(image)
+                return Image.open(BytesIO(data))
+        except Exception:
+            pass
+        
+        # If none of the above worked, raise an error
+        raise ValueError(
+            f"Unsupported image format: {type(image)}. "
+            "Should be a URL linking to an image, a local path, a PIL Image, "
+            "bytes data, or a Replicate Input object."
+        )
+    
+    except Exception as e:
+        if "Unsupported image format" in str(e):
+            raise  # Re-raise our custom error
+        else:
+            raise ValueError(
+                f"Failed to load image: {e}. "
+                "Please ensure the image is accessible and in a supported format (JPEG, PNG, WebP, etc.)"
+            )
+
+
+def download_from_huggingface_cli(repo_id: str, cache_dir: str = "./hf-models") -> str:
+    """
+    Download a complete HuggingFace model using HF CLI equivalent in Python.
+    
+    Args:
+        repo_id: HuggingFace repository ID (e.g., "drawhisper/illustrious-xl")
+        cache_dir: Local cache directory
+    
+    Returns:
+        Path to the downloaded model directory
+    """
+    try:
+        from huggingface_hub import snapshot_download
+        
+        print(f"Downloading complete model {repo_id} using HF CLI equivalent...")
+        ensure_directory(cache_dir)
+        
+        # Use snapshot_download to get the entire model (equivalent to `hf download`)
+        model_path = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=cache_dir,
+            local_dir=os.path.join(cache_dir, repo_id.replace('/', '--')),
+            local_dir_use_symlinks=False,  # Use actual files, not symlinks
+        )
+        
+        print(f"HuggingFace model downloaded to: {model_path}")
+        return model_path
+        
+    except ImportError:
+        raise RuntimeError("huggingface_hub is required for HuggingFace downloads. Install with: pip install huggingface_hub")
+    except Exception as e:
+        raise RuntimeError(f"Failed to download {repo_id} using HF CLI: {e}")
 
 
 def download_from_huggingface(repo_id: str, filename: str, cache_dir: Optional[str] = None) -> str:
@@ -107,73 +235,78 @@ class TokenEmbeddingsHandler:
             print(f"Failed to load embeddings from {embeddings_path}: {e}")
 
 
-def load_lora_weights_to_unet(unet, lora_path: Path, device: str = "cuda") -> Dict[str, Any]:
+def load_lora_weights_to_pipeline(pipeline, lora_path: Path, adapter_name: str = "default", lora_scale: float = 1.0):
     """
-    Load LoRA weights into a UNet model.
+    Load LoRA weights into a diffusers pipeline using the built-in method.
     
     Args:
-        unet: The UNet model to load LoRA into
+        pipeline: The diffusers pipeline to load LoRA into
         lora_path: Path to the LoRA .safetensors file
-        device: Device to load the LoRA on
-    
-    Returns:
-        Dictionary containing LoRA tensors for reference
+        adapter_name: Name for the LoRA adapter
+        lora_scale: Scale factor for the LoRA weights
     """
     if not ML_LIBRARIES_AVAILABLE:
         raise RuntimeError("ML libraries (diffusers, safetensors) not available. Install requirements.txt dependencies.")
     
-    print(f"Loading LoRA weights from {lora_path}")
+    print(f"Loading LoRA weights from {lora_path} with scale {lora_scale}")
     
-    # Load LoRA tensors
-    tensors = load_file(lora_path)
-    
-    # Extract rank information from LoRA tensors
-    unet_lora_attn_procs = {}
-    name_rank_map = {}
-    
-    # First pass: determine ranks
-    for tensor_key, tensor_value in tensors.items():
-        if tensor_key.endswith("up.weight"):
-            proc_name = ".".join(tensor_key.split(".")[:-3])
-            rank = tensor_value.shape[1]
-            name_rank_map[proc_name] = rank
-    
-    # Second pass: create LoRA attention processors
-    for name, attn_processor in unet.attn_processors.items():
-        cross_attention_dim = (
-            None
-            if name.endswith("attn1.processor")
-            else unet.config.cross_attention_dim
+    try:
+        # Use diffusers' built-in LoRA loading functionality
+        pipeline.load_lora_weights(
+            str(lora_path),
+            adapter_name=adapter_name,
         )
         
-        # Determine hidden size based on block type
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
-        else:
-            # Skip if we can't determine the block type
-            continue
+        # Set the LoRA scale
+        pipeline.set_adapters([adapter_name], adapter_weights=[lora_scale])
         
-        # Only create LoRA processor if we have rank information
-        if name in name_rank_map:
-            lora_processor = LoRAAttnProcessor2_0(
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-                rank=name_rank_map[name],
-            )
-            unet_lora_attn_procs[name] = lora_processor.to(device)
+        print(f"✅ Successfully loaded LoRA '{adapter_name}' with scale {lora_scale}")
+        
+    except Exception as e:
+        print(f"❌ Failed to load LoRA from {lora_path}: {e}")
+        # Try alternative loading method for older LoRA formats
+        try:
+            print("Trying alternative LoRA loading method...")
+            pipeline.load_lora_weights(str(lora_path.parent), weight_name=lora_path.name)
+            if hasattr(pipeline, 'fuse_lora'):
+                pipeline.fuse_lora(lora_scale=lora_scale)
+            print(f"✅ Successfully loaded LoRA using alternative method with scale {lora_scale}")
+        except Exception as e2:
+            raise RuntimeError(f"Failed to load LoRA with both methods. Error 1: {e}, Error 2: {e2}")
+
+
+def unload_lora_weights_from_pipeline(pipeline, adapter_name: str = "default"):
+    """
+    Unload LoRA weights from a diffusers pipeline.
     
-    # Set attention processors and load state dict
-    unet.set_attn_processor(unet_lora_attn_procs)
-    unet.load_state_dict(tensors, strict=False)
-    
-    print(f"Successfully loaded LoRA with {len(name_rank_map)} attention processors")
-    return tensors
+    Args:
+        pipeline: The diffusers pipeline to unload LoRA from
+        adapter_name: Name of the LoRA adapter to unload
+    """
+    try:
+        if hasattr(pipeline, 'delete_adapters'):
+            pipeline.delete_adapters([adapter_name])
+            print(f"✅ Successfully unloaded LoRA adapter '{adapter_name}'")
+        elif hasattr(pipeline, 'unfuse_lora'):
+            pipeline.unfuse_lora()
+            print("✅ Successfully unfused LoRA weights")
+        else:
+            print("⚠️ Pipeline does not support LoRA unloading")
+    except Exception as e:
+        print(f"⚠️ Failed to unload LoRA: {e}")
+
+
+# Legacy function for backward compatibility
+def load_lora_weights_to_unet(unet, lora_path: Path, device: str = "cuda") -> Dict[str, Any]:
+    """
+    Legacy function - use load_lora_weights_to_pipeline instead.
+    This function is kept for backward compatibility but is deprecated.
+    """
+    print("⚠️ Warning: load_lora_weights_to_unet is deprecated. Use load_lora_weights_to_pipeline instead.")
+    raise NotImplementedError(
+        "Manual UNet LoRA loading is deprecated. "
+        "Use load_lora_weights_to_pipeline with the full pipeline instead."
+    )
 
 
 def merge_lora_weights(tensors_list: List[Dict[str, torch.Tensor]], scales: List[float]) -> Dict[str, torch.Tensor]:
@@ -630,12 +763,10 @@ LOCAL_MODELS_DIR = "./local-models"
 # Local custom models configuration for development/testing
 LOCAL_CUSTOM_MODELS = {
     "illustrious-xl": {
-        "type": "unet_only",
-        "source": "huggingface",
+        "type": "complete",
+        "source": "huggingface_cli",
         "repo_id": "drawhisper/illustrious-xl",
-        "filename": "illustrious-xl.safetensors",
-        "url": "https://huggingface.co/drawhisper/illustrious-xl/resolve/main/illustrious-xl.safetensors",
-        "description": "Illustrious XL - High-quality anime/illustration generation (Default)",
+        "description": "Illustrious XL - High-quality base model for anime/illustration generation (Default)",
         "recommended_cfg": 6.0,
         "recommended_steps": 28,
         "recommended_negative": "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry",
@@ -690,10 +821,24 @@ def download_custom_model_local(model_name: str, cache_dir: str = "./custom-mode
         print(f"Using pre-cached model: {production_path}")
         return production_path
     
-    # Try HuggingFace download first if it's a HF model
-    if config.get("source") == "huggingface" and "repo_id" in config and "filename" in config:
+    # Try HuggingFace CLI download first if it's a HF CLI model
+    if config.get("source") == "huggingface_cli" and "repo_id" in config:
         try:
-            print(f"Attempting HuggingFace download for {model_name}...")
+            print(f"Attempting HuggingFace CLI download for {model_name}...")
+            hf_cached_path = download_from_huggingface_cli(
+                repo_id=config["repo_id"],
+                cache_dir=cache_dir
+            )
+            print(f"Using HuggingFace CLI cached model: {hf_cached_path}")
+            return hf_cached_path
+        except Exception as e:
+            print(f"HuggingFace CLI download failed: {e}")
+            print("Model not available via HF CLI, skipping...")
+    
+    # Try HuggingFace single file download if it's a HF model
+    elif config.get("source") == "huggingface" and "repo_id" in config and "filename" in config:
+        try:
+            print(f"Attempting HuggingFace single file download for {model_name}...")
             hf_cached_path = download_from_huggingface(
                 repo_id=config["repo_id"],
                 filename=config["filename"]
@@ -705,7 +850,7 @@ def download_custom_model_local(model_name: str, cache_dir: str = "./custom-mode
             print("Falling back to direct URL download...")
     
     # Download from URL (fallback for local development or if HF download failed)
-    if config["type"] == "unet_only":
+    if config["type"] == "safetensors_only":
         # Use original filename if available, otherwise generate one
         if "filename" in config:
             filename = config["filename"]
@@ -714,7 +859,7 @@ def download_custom_model_local(model_name: str, cache_dir: str = "./custom-mode
         model_path = os.path.join(cache_dir, filename)
         if not os.path.exists(model_path):
             if "url" in config:
-                print(f"Downloading {model_name} UNet from {config['url']}")
+                print(f"Downloading {model_name} from {config['url']}")
                 
                 # Use pget with retry logic (Replicate's recommended approach)
                 max_retries = 3
