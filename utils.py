@@ -21,6 +21,41 @@ except ImportError:
     ML_LIBRARIES_AVAILABLE = False
 
 
+def download_from_huggingface(repo_id: str, filename: str, cache_dir: Optional[str] = None) -> str:
+    """
+    Download a file from HuggingFace using native caching.
+    
+    Args:
+        repo_id: HuggingFace repository ID (e.g., "drawhisper/illustrious-xl")
+        filename: File name to download (e.g., "illustrious-xl.safetensors")
+        cache_dir: Optional cache directory (defaults to HF default cache)
+    
+    Returns:
+        Path to the downloaded file in HF cache
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+        
+        print(f"Downloading {filename} from HuggingFace repo: {repo_id}")
+        
+        kwargs = {
+            "repo_id": repo_id,
+            "filename": filename,
+        }
+        
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+            
+        local_file_path = hf_hub_download(**kwargs)
+        print(f"HuggingFace file downloaded to: {local_file_path}")
+        return local_file_path
+        
+    except ImportError:
+        raise RuntimeError("huggingface_hub is required for HuggingFace downloads. Install with: pip install huggingface_hub")
+    except Exception as e:
+        raise RuntimeError(f"Failed to download {filename} from HuggingFace repo {repo_id}: {e}")
+
+
 def download_weights(url: str, dest: str):
     """
     Download weights from a URL using pget (parallel downloader).
@@ -596,6 +631,9 @@ LOCAL_MODELS_DIR = "./local-models"
 LOCAL_CUSTOM_MODELS = {
     "illustrious-xl": {
         "type": "unet_only",
+        "source": "huggingface",
+        "repo_id": "drawhisper/illustrious-xl",
+        "filename": "illustrious-xl.safetensors",
         "url": "https://huggingface.co/drawhisper/illustrious-xl/resolve/main/illustrious-xl.safetensors",
         "description": "Illustrious XL - High-quality anime/illustration generation (Default)",
         "recommended_cfg": 6.0,
@@ -643,14 +681,37 @@ def download_custom_model_local(model_name: str, cache_dir: str = "./custom-mode
         return config["local_path"]
     
     # Check for pre-downloaded model in production (cog.yaml downloads to /src/custom-models)
-    production_path = f"/src/custom-models/{model_name}-unet.safetensors"
+    if "filename" in config:
+        production_path = f"/src/custom-models/{config['filename']}"
+    else:
+        production_path = f"/src/custom-models/{model_name}.safetensors"
+    
     if os.path.exists(production_path):
         print(f"Using pre-cached model: {production_path}")
         return production_path
     
-    # Download from URL (fallback for local development or if pre-cache failed)
+    # Try HuggingFace download first if it's a HF model
+    if config.get("source") == "huggingface" and "repo_id" in config and "filename" in config:
+        try:
+            print(f"Attempting HuggingFace download for {model_name}...")
+            hf_cached_path = download_from_huggingface(
+                repo_id=config["repo_id"],
+                filename=config["filename"]
+            )
+            print(f"Using HuggingFace cached model: {hf_cached_path}")
+            return hf_cached_path
+        except Exception as e:
+            print(f"HuggingFace download failed: {e}")
+            print("Falling back to direct URL download...")
+    
+    # Download from URL (fallback for local development or if HF download failed)
     if config["type"] == "unet_only":
-        model_path = os.path.join(cache_dir, f"{model_name}-unet.safetensors")
+        # Use original filename if available, otherwise generate one
+        if "filename" in config:
+            filename = config["filename"]
+        else:
+            filename = f"{model_name}.safetensors"
+        model_path = os.path.join(cache_dir, filename)
         if not os.path.exists(model_path):
             if "url" in config:
                 print(f"Downloading {model_name} UNet from {config['url']}")

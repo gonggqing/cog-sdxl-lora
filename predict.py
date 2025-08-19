@@ -227,24 +227,9 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         try:
             print("Loading Illustrious XL UNet as default model...")
             
-            # Try multiple paths: pre-cached, local download, then fallback
-            illustrious_paths_to_try = [
-                "/src/illustrious-xl-unet/illustrious-xl.safetensors",  # Pre-cached during build
-                "/src/custom-models/illustrious-xl-unet.safetensors",  # Alternative pre-cache location
-            ]
-            
-            illustrious_path = None
-            for path in illustrious_paths_to_try:
-                if os.path.exists(path):
-                    illustrious_path = path
-                    print(f"Found pre-cached Illustrious XL at: {path}")
-                    break
-            
-            # If not found, download it
-            if not illustrious_path:
-                print("Illustrious XL not found in cache, downloading...")
-                illustrious_path = download_custom_model_local("illustrious-xl")
-                print(f"Downloaded Illustrious XL to: {illustrious_path}")
+            # Use the enhanced download function that handles HF cache, pre-cache, and fallbacks
+            illustrious_path = download_custom_model_local("illustrious-xl")
+            print(f"Illustrious XL model located at: {illustrious_path}")
             
             # Load the UNet model
             from diffusers import UNet2DConditionModel
