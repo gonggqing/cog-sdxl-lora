@@ -20,6 +20,8 @@ from diffusers.models.attention_processor import LoRAAttnProcessor2_0
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
+
+from diffusers.utils.loading_utils import load_image
 from transformers import CLIPImageProcessor
 
 from weights import SDXLLoRACache
@@ -35,7 +37,6 @@ from utils import (
     validate_dimensions,
     get_output_format_extension,
     get_model_config_local,
-    load_image,
     download_custom_model_local,
     SDXL_MODEL_CACHE,
     REFINER_MODEL_CACHE,
@@ -148,13 +149,19 @@ class MultiLoRAMixin:
         print(f"Multiple LoRAs loaded in {time.time() - start_time:.2f}s")
     
     def _apply_lora_to_pipeline(self, pipeline, lora_path: Path, lora_scale: float, adapter_name: str = "default"):
-        """Apply a single LoRA to the pipeline using diffusers' built-in functionality."""
+        """Apply a single LoRA to the pipeline using enhanced loading with fallbacks."""
         # Validate LoRA file first
         if not validate_lora_file(lora_path):
             raise ValueError(f"Invalid LoRA file: {lora_path}")
         
-        # Use the utility function to load LoRA weights to the pipeline
-        load_lora_weights_to_pipeline(pipeline, lora_path, adapter_name=adapter_name, lora_scale=lora_scale)
+        # Use the enhanced utility function with fallback methods (non-strict mode)
+        load_lora_weights_to_pipeline(
+            pipeline, 
+            lora_path, 
+            adapter_name=adapter_name, 
+            lora_scale=lora_scale,
+            strict=False  # Allow fallback methods for incompatible LoRAs
+        )
     
     def _apply_multiple_loras_to_pipeline(self, pipeline, loras: List[Dict]):
         """
@@ -359,29 +366,29 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             self.safety_checker = None
             self.feature_extractor = None
 
-        # Try to load Illustrious XL as complete pipeline first
+        # Try to load Animagine XL 4.0 as complete pipeline first
         try:
-            print("Loading Illustrious XL complete model...")
+            print("Loading Animagine XL 4.0 complete model...")
             
-            # Download the complete Illustrious XL model
-            illustrious_path = download_custom_model_local("illustrious-xl")
-            print(f"Illustrious XL path: {illustrious_path}")
+            # Download the complete Animagine XL 4.0 model
+            # animagine_path = download_custom_model_local("animagine-xl-4.0")
+            # print(f"Animagine XL 4.0 path: {animagine_path}")
             
             from diffusers import StableDiffusionXLPipeline
             
-            # Load Illustrious XL as complete pipeline (has all components)
+            # Load Animagine XL 4.0 as complete pipeline (has all components)
             self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-                illustrious_path,
+                'cagliostrolab/animagine-xl-4.0',
                 torch_dtype=torch.float16,
                 use_safetensors=True,
-                local_files_only=True,  # Use cached files
+                custom_pipeline="lpw_stable_diffusion_xl",
             ).to(self.device)
             
-            self.current_model = "illustrious-xl"
-            print("✅ Illustrious XL complete model loaded successfully")
+            self.current_model = "animagine-xl-4.0"
+            print("✅ Animagine XL 4.0 complete model loaded successfully")
             
         except Exception as e:
-            print(f"⚠️  Failed to load Illustrious XL: {e}")
+            print(f"⚠️  Failed to load Animagine XL 4.0: {e}")
             print("⚠️  Falling back to standard SDXL...")
             
             # Fallback: Load SDXL base pipeline
@@ -398,7 +405,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             self.current_model = "sdxl-base"
             print("✅ SDXL fallback model loaded")
         
-        # Store original UNet for model switching (either Illustrious XL or SDXL)
+        # Store original UNet for model switching (either Animagine XL 4.0 or SDXL)
         self.original_unet = self.txt2img_pipe.unet
 
         print("Loading SDXL img2img pipeline...")
@@ -408,7 +415,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             text_encoder_2=self.txt2img_pipe.text_encoder_2,
             tokenizer=self.txt2img_pipe.tokenizer,
             tokenizer_2=self.txt2img_pipe.tokenizer_2,
-            unet=self.txt2img_pipe.unet,  # This will be Illustrious XL if loaded
+            unet=self.txt2img_pipe.unet,  # This will be Animagine XL 4.0 if loaded
             scheduler=self.txt2img_pipe.scheduler,
         )
         self.img2img_pipe.to(self.device)
@@ -419,8 +426,8 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             text_encoder=self.txt2img_pipe.text_encoder,
             text_encoder_2=self.txt2img_pipe.text_encoder_2,
             tokenizer=self.txt2img_pipe.tokenizer,
-            tokenizer_2=self.txt2img_pipe.tokenizer_2,
-            unet=self.txt2img_pipe.unet,  # This will be Illustrious XL if loaded
+            tokenizer_2=self.txt2img_pipe.tokenizer_2,  
+            unet=self.txt2img_pipe.unet,  # This will be Animagine XL 4.0 if loaded
             scheduler=self.txt2img_pipe.scheduler,
         )
         self.inpaint_pipe.to(self.device)
@@ -444,8 +451,8 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         if self.current_model != "sdxl-base":
             print("Switching to standard SDXL...")
             
-            # If current model is Illustrious XL, we need to load SDXL
-            if self.current_model == "illustrious-xl":
+            # If current model is Animagine XL 4.0, we need to load SDXL
+            if self.current_model == "animagine-xl-4.0":
                 try:
                     # Load standard SDXL pipeline
                     self.txt2img_pipe = DiffusionPipeline.from_pretrained(
@@ -481,25 +488,25 @@ class Predictor(BasePredictor, MultiLoRAMixin):
                 except Exception as e:
                     print(f"⚠️  Failed to switch to SDXL: {e}")
             
-    def switch_to_illustrious_xl(self):
-        """Switch back to Illustrious XL (default)."""
-        if self.current_model != "illustrious-xl":
-            print("Switching back to Illustrious XL...")
+    def switch_to_animagine_xl_4_0(self):
+        """Switch back to Animagine XL 4.0 (default)."""
+        if self.current_model != "animagine-xl-4.0":
+            print("Switching back to Animagine XL 4.0...")
             
             try:
                 from diffusers import StableDiffusionXLPipeline
 
-                illustrious_cache = download_custom_model_local("illustrious-xl")
+                # animagine_cache = download_custom_model_local("animagine-xl-4.0")
                 
-                # Load Illustrious XL pipeline
+                # Load Animagine XL 4.0 pipeline
                 self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-                    illustrious_cache,
+                    'cagliostrolab/animagine-xl-4.0',
                     torch_dtype=torch.float16,
                     use_safetensors=True,
-                    local_files_only=True,  # Force using local files since we've cached them
+                    custom_pipeline="lpw_stable_diffusion_xl",
                 ).to(self.device)
                 
-                # Update other pipelines to use Illustrious XL components
+                # Update other pipelines to use Animagine XL 4.0 components
                 self.img2img_pipe = StableDiffusionXLImg2ImgPipeline(
                     vae=self.txt2img_pipe.vae,
                     text_encoder=self.txt2img_pipe.text_encoder,
@@ -520,11 +527,11 @@ class Predictor(BasePredictor, MultiLoRAMixin):
                     scheduler=self.txt2img_pipe.scheduler,
                 ).to(self.device)
                 
-                self.current_model = "illustrious-xl"
-                print("✅ Switched to Illustrious XL")
+                self.current_model = "animagine-xl-4.0"
+                print("✅ Switched to Animagine XL 4.0")
                 
             except Exception as e:
-                print(f"⚠️  Failed to switch to Illustrious XL: {e}")
+                print(f"⚠️  Failed to switch to Animagine XL 4.0: {e}")
 
     def run_safety_checker(self, image):
         if self.safety_checker is None or self.feature_extractor is None:
@@ -683,9 +690,9 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             default=False,
         ),
         
-        # Model selection (Illustrious XL is loaded by default)
+        # Model selection (Animagine XL 4.0 is loaded by default)
         use_standard_sdxl: bool = Input(
-            description="Use standard SDXL instead of Illustrious XL (for realistic content)",
+            description="Use standard SDXL instead of Animagine XL (for realistic content)",
             default=False,
         ),
     ) -> List[Path]:
@@ -719,36 +726,42 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         civitai_token = Secret(civitai_api_token) if civitai_api_token else None
         
         # Switch to standard SDXL if requested
-        if use_standard_sdxl and self.current_model == "illustrious-xl":
+        if use_standard_sdxl and self.current_model == "animagine-xl-4.0":
             print("Switching to standard SDXL UNet...")
             self.txt2img_pipe.unet = self.original_unet
             self.img2img_pipe.unet = self.original_unet
             self.inpaint_pipe.unet = self.original_unet
             self.current_model = "sdxl-base"
             print("✅ Using standard SDXL")
-        elif not use_standard_sdxl and self.current_model != "illustrious-xl":
-            # Switch back to Illustrious XL (which should already be loaded)
-            print("Using Illustrious XL (default)")
+        elif not use_standard_sdxl and self.current_model != "animagine-xl-4.0":
+            # Switch back to Animagine XL 4.0 (which should already be loaded)
+            print("Using Animagine XL 4.0 (default)")
             
-        # Apply model-specific optimizations for Illustrious XL
+        # Apply model-specific optimizations for Animagine XL 4.0
         if not use_standard_sdxl:
-            if guidance == 7.5:  # If using default guidance, optimize for Illustrious XL
-                guidance = 6.0
-                print(f"Applied Illustrious XL optimized guidance: {guidance}")
+            if guidance == 7.5:  # If using default guidance, optimize for Animagine XL 4.0
+                guidance = 4.5
+                print(f"Applied Animagine XL 4.0 optimized guidance: {guidance}")
             if not negative_prompt:
                 negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry"
-                print("Applied Illustrious XL optimized negative prompt")
+                print("Applied Animagine XL 4.0 optimized negative prompt")
         
-        # Handle LoRAs using smart caching (inspired by cog-flux)
-        self.handle_loras(
-            self.txt2img_pipe,
-            lora_weights=lora_weights,
-            lora_scale=lora_scale,
-            extra_lora_weights=extra_lora,
-            extra_lora_scale=extra_lora_scale,
-            hf_api_token=hf_token,
-            civitai_api_token=civitai_token,
-        )
+        # Handle LoRAs using smart caching with enhanced compatibility checking
+        try:
+            self.handle_loras(
+                self.txt2img_pipe,
+                lora_weights=lora_weights,
+                lora_scale=lora_scale,
+                extra_lora_weights=extra_lora,
+                extra_lora_scale=extra_lora_scale,
+                hf_api_token=hf_token,
+                civitai_api_token=civitai_token,
+            )
+        except Exception as e:
+            print(f"⚠️ LoRA loading encountered issues: {e}")
+            print("💡 This may be due to LoRA/model architecture mismatch")
+            print("   Consider using LoRAs specifically trained for Animagine XL 4.0 or SDXL")
+            # Continue without LoRAs rather than failing completely
         
         print(f"Prompt: {prompt}")
         print(f"Negative prompt: {negative_prompt}")

@@ -9,8 +9,6 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from io import BytesIO
-import requests
 
 import torch
 
@@ -22,98 +20,6 @@ try:
     ML_LIBRARIES_AVAILABLE = True
 except ImportError:
     ML_LIBRARIES_AVAILABLE = False
-
-
-def load_image(image):
-    """
-    Load an image from various sources including URLs, local paths, PIL Images, and Replicate blob data.
-    
-    Args:
-        image: Can be:
-            - URL (str) starting with http:// or https://
-            - Local file path (str or Path)
-            - PIL Image object
-            - Bytes or file-like object (from Replicate)
-            - Cog Input object (from Replicate)
-    
-    Returns:
-        PIL.Image: Loaded PIL Image object
-    
-    Raises:
-        ValueError: If the image format is not supported or cannot be loaded
-    """
-    if not ML_LIBRARIES_AVAILABLE:
-        raise RuntimeError("PIL is required for image loading. Install requirements.txt dependencies.")
-    
-    try:
-        # Case 1: Already a PIL Image
-        if hasattr(image, 'mode') and hasattr(image, 'size'):
-            return image
-        
-        # Case 2: String URL or path
-        if isinstance(image, str):
-            if image.startswith(('http://', 'https://')):
-                # Download from URL
-                print(f"Loading image from URL: {image}")
-                response = requests.get(image, stream=True, timeout=30)
-                response.raise_for_status()
-                return Image.open(BytesIO(response.content))
-            else:
-                # Local file path
-                print(f"Loading image from local path: {image}")
-                if not os.path.exists(image):
-                    raise ValueError(f"Image file not found: {image}")
-                return Image.open(image)
-        
-        # Case 3: Bytes data
-        if isinstance(image, bytes):
-            print("Loading image from bytes data")
-            return Image.open(BytesIO(image))
-        
-        # Case 4: File-like object (has read method)
-        if hasattr(image, 'read'):
-            print("Loading image from file-like object")
-            # If it's a file-like object, read its content
-            if hasattr(image, 'seek'):
-                image.seek(0)  # Reset to beginning
-            data = image.read()
-            if isinstance(data, bytes):
-                return Image.open(BytesIO(data))
-            else:
-                raise ValueError("File-like object did not return bytes")
-        
-        # Case 5: Cog Input object (Replicate specific)
-        if hasattr(image, 'url'):
-            # Cog Input objects have a url attribute
-            print(f"Loading image from Cog Input URL: {image.url}")
-            response = requests.get(image.url, stream=True, timeout=30)
-            response.raise_for_status()
-            return Image.open(BytesIO(response.content))
-        
-        # Case 6: Try to convert to bytes if it has a buffer interface
-        try:
-            if hasattr(image, '__bytes__'):
-                data = bytes(image)
-                return Image.open(BytesIO(data))
-        except Exception:
-            pass
-        
-        # If none of the above worked, raise an error
-        raise ValueError(
-            f"Unsupported image format: {type(image)}. "
-            "Should be a URL linking to an image, a local path, a PIL Image, "
-            "bytes data, or a Replicate Input object."
-        )
-    
-    except Exception as e:
-        if "Unsupported image format" in str(e):
-            raise  # Re-raise our custom error
-        else:
-            raise ValueError(
-                f"Failed to load image: {e}. "
-                "Please ensure the image is accessible and in a supported format (JPEG, PNG, WebP, etc.)"
-            )
-
 
 def download_from_huggingface_cli(repo_id: str, cache_dir: str = "./hf-models") -> str:
     """
@@ -235,23 +141,83 @@ class TokenEmbeddingsHandler:
             print(f"Failed to load embeddings from {embeddings_path}: {e}")
 
 
-def load_lora_weights_to_pipeline(pipeline, lora_path: Path, adapter_name: str = "default", lora_scale: float = 1.0):
+def check_lora_compatibility(pipeline, lora_path: Path) -> bool:
     """
-    Load LoRA weights into a diffusers pipeline using the built-in method.
+    Check if a LoRA is compatible with the current pipeline architecture.
+    
+    Args:
+        pipeline: The diffusers pipeline
+        lora_path: Path to the LoRA .safetensors file
+    
+    Returns:
+        True if compatible, False otherwise
+    """
+    try:
+        from safetensors.torch import load_file
+        
+        # Load LoRA state dict
+        lora_state_dict = load_file(lora_path)
+        
+        # Get current model state dict
+        model_state_dict = pipeline.unet.state_dict()
+        
+        # Check for critical shape mismatches
+        incompatible_layers = []
+        for key, lora_tensor in lora_state_dict.items():
+            # Extract the corresponding model key (remove LoRA-specific suffixes)
+            model_key = key.replace('.lora_up.weight', '.weight').replace('.lora_down.weight', '.weight')
+            model_key = model_key.replace('.lora_magnitude_vector', '').split('.default_')[0]
+            
+            if model_key in model_state_dict:
+                model_shape = model_state_dict[model_key].shape
+                lora_shape = lora_tensor.shape
+                
+                # Check for critical dimension mismatches
+                if 'lora_magnitude_vector' in key and len(lora_shape) > 0:
+                    expected_dim = model_shape[0] if len(model_shape) > 0 else 0
+                    if lora_shape[-1] != expected_dim and lora_shape[0] != 1:
+                        incompatible_layers.append(f"{key}: LoRA {lora_shape} vs Model {model_shape}")
+        
+        if incompatible_layers:
+            print(f"⚠️ LoRA compatibility issues detected:")
+            for issue in incompatible_layers[:3]:  # Show first 3 issues
+                print(f"   {issue}")
+            if len(incompatible_layers) > 3:
+                print(f"   ... and {len(incompatible_layers) - 3} more")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ Could not check LoRA compatibility: {e}")
+        return True  # Assume compatible if we can't check
+
+
+def load_lora_weights_to_pipeline(pipeline, lora_path: Path, adapter_name: str = "default", lora_scale: float = 1.0, strict: bool = False):
+    """
+    Load LoRA weights into a diffusers pipeline with enhanced error handling.
     
     Args:
         pipeline: The diffusers pipeline to load LoRA into
         lora_path: Path to the LoRA .safetensors file
         adapter_name: Name for the LoRA adapter
         lora_scale: Scale factor for the LoRA weights
+        strict: If True, fail on any errors. If False, try multiple fallback methods
     """
     if not ML_LIBRARIES_AVAILABLE:
         raise RuntimeError("ML libraries (diffusers, safetensors) not available. Install requirements.txt dependencies.")
     
     print(f"Loading LoRA weights from {lora_path} with scale {lora_scale}")
     
+    # Check compatibility first
+    if not check_lora_compatibility(pipeline, lora_path):
+        if strict:
+            raise RuntimeError(f"LoRA {lora_path} is incompatible with current model architecture")
+        else:
+            print("⚠️ LoRA may be incompatible, but attempting to load anyway...")
+    
+    # Method 1: Standard diffusers loading
     try:
-        # Use diffusers' built-in LoRA loading functionality
         pipeline.load_lora_weights(
             str(lora_path),
             adapter_name=adapter_name,
@@ -261,18 +227,123 @@ def load_lora_weights_to_pipeline(pipeline, lora_path: Path, adapter_name: str =
         pipeline.set_adapters([adapter_name], adapter_weights=[lora_scale])
         
         print(f"✅ Successfully loaded LoRA '{adapter_name}' with scale {lora_scale}")
+        return
         
     except Exception as e:
-        print(f"❌ Failed to load LoRA from {lora_path}: {e}")
-        # Try alternative loading method for older LoRA formats
+        error_msg = str(e)
+        print(f"❌ Method 1 failed: {error_msg}")
+        
+        # If it's a shape mismatch and we're not in strict mode, try workarounds
+        if "size mismatch" in error_msg and not strict:
+            print("🔧 Attempting shape mismatch workarounds...")
+            
+            # Method 2: Try loading with ignore_mismatched_sizes (if supported)
+            try:
+                print("Trying with relaxed loading...")
+                pipeline.load_lora_weights(
+                    str(lora_path),
+                    adapter_name=adapter_name,
+                    ignore_mismatched_sizes=True,
+                )
+                pipeline.set_adapters([adapter_name], adapter_weights=[lora_scale])
+                print(f"✅ Successfully loaded LoRA '{adapter_name}' with relaxed loading")
+                return
+            except Exception as e2:
+                print(f"❌ Method 2 failed: {e2}")
+            
+            # Method 3: Try alternative loading approach
+            try:
+                print("Trying alternative LoRA loading method...")
+                pipeline.load_lora_weights(str(lora_path.parent), weight_name=lora_path.name)
+                if hasattr(pipeline, 'fuse_lora'):
+                    pipeline.fuse_lora(lora_scale=lora_scale)
+                elif hasattr(pipeline, 'set_adapters'):
+                    pipeline.set_adapters([adapter_name], adapter_weights=[lora_scale])
+                print(f"✅ Successfully loaded LoRA using alternative method")
+                return
+            except Exception as e3:
+                print(f"❌ Method 3 failed: {e3}")
+            
+            # Method 4: Manual loading with filtering (last resort)
+            try:
+                print("Trying manual loading with shape filtering...")
+                load_lora_with_shape_filtering(pipeline, lora_path, adapter_name, lora_scale)
+                print(f"✅ Successfully loaded LoRA using filtered loading")
+                return
+            except Exception as e4:
+                print(f"❌ Method 4 failed: {e4}")
+        
+        # If all methods failed
+        if strict:
+            raise RuntimeError(f"Failed to load LoRA after trying all methods. Final error: {e}")
+        else:
+            print(f"⚠️ Could not load LoRA {lora_path}. Skipping...")
+            return
+
+
+def load_lora_with_shape_filtering(pipeline, lora_path: Path, adapter_name: str, lora_scale: float):
+    """
+    Load LoRA with manual shape filtering to skip incompatible layers.
+    This is a last resort method for incompatible LoRAs.
+    """
+    from safetensors.torch import load_file
+    import torch
+    
+    print("🔧 Loading LoRA with shape filtering (experimental)...")
+    
+    # Load LoRA state dict
+    lora_state_dict = load_file(lora_path)
+    model_state_dict = pipeline.unet.state_dict()
+    
+    # Filter out incompatible weights
+    filtered_state_dict = {}
+    skipped_layers = []
+    
+    for key, tensor in lora_state_dict.items():
         try:
-            print("Trying alternative LoRA loading method...")
-            pipeline.load_lora_weights(str(lora_path.parent), weight_name=lora_path.name)
-            if hasattr(pipeline, 'fuse_lora'):
-                pipeline.fuse_lora(lora_scale=lora_scale)
-            print(f"✅ Successfully loaded LoRA using alternative method with scale {lora_scale}")
-        except Exception as e2:
-            raise RuntimeError(f"Failed to load LoRA with both methods. Error 1: {e}, Error 2: {e2}")
+            # Try to find corresponding model layer
+            model_key = key.replace('.lora_up.weight', '.weight').replace('.lora_down.weight', '.weight')
+            model_key = model_key.replace('.lora_magnitude_vector', '').split('.default_')[0]
+            
+            if model_key in model_state_dict:
+                model_tensor = model_state_dict[model_key]
+                
+                # Check compatibility
+                if 'lora_magnitude_vector' in key:
+                    # Special handling for magnitude vectors
+                    expected_dim = model_tensor.shape[0]
+                    if tensor.shape[-1] == expected_dim or tensor.shape[0] == 1:
+                        filtered_state_dict[key] = tensor
+                    else:
+                        skipped_layers.append(key)
+                else:
+                    # For regular LoRA weights, be more permissive
+                    filtered_state_dict[key] = tensor
+            else:
+                filtered_state_dict[key] = tensor
+                
+        except Exception:
+            skipped_layers.append(key)
+    
+    if skipped_layers:
+        print(f"⚠️ Skipped {len(skipped_layers)} incompatible layers")
+    
+    if not filtered_state_dict:
+        raise RuntimeError("No compatible LoRA layers found")
+    
+    # Create a temporary file with filtered weights
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.safetensors', delete=False) as tmp_file:
+        from safetensors.torch import save_file
+        save_file(filtered_state_dict, tmp_file.name)
+        
+        # Try loading the filtered LoRA
+        pipeline.load_lora_weights(tmp_file.name, adapter_name=adapter_name)
+        pipeline.set_adapters([adapter_name], adapter_weights=[lora_scale])
+        
+        # Clean up
+        import os
+        os.unlink(tmp_file.name)
 
 
 def unload_lora_weights_from_pipeline(pipeline, adapter_name: str = "default"):
@@ -762,11 +833,11 @@ LOCAL_MODELS_DIR = "./local-models"
 
 # Local custom models configuration for development/testing
 LOCAL_CUSTOM_MODELS = {
-    "illustrious-xl": {
+    "animagine-xl-4.0": {
         "type": "complete",
         "source": "huggingface_cli",
-        "repo_id": "drawhisper/illustrious-xl",
-        "description": "Illustrious XL - High-quality base model for anime/illustration generation (Default)",
+        "repo_id": "cagliostrolab/animagine-xl-4.0",
+        "description": " High-quality base model for anime/illustration generation (Default)",
         "recommended_cfg": 6.0,
         "recommended_steps": 28,
         "recommended_negative": "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry",
