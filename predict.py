@@ -2,17 +2,24 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import shutil
+
 import numpy as np
 import torch
 from cog import BasePredictor, Input, Path, Secret
 from diffusers import (
     DDIMScheduler,
+    DDPMScheduler,
+    DEISMultistepScheduler,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
+    DPMSolverSinglestepScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
     HeunDiscreteScheduler,
+    LMSDiscreteScheduler,
     PNDMScheduler,
+    UniPCMultistepScheduler,
     StableDiffusionXLImg2ImgPipeline,
     StableDiffusionXLInpaintPipeline,
 )
@@ -27,17 +34,12 @@ from transformers import CLIPImageProcessor
 from weights import SDXLLoRACache
 from utils import (
     download_weights,
-    TokenEmbeddingsHandler,
     load_lora_weights_to_pipeline,
-    unload_lora_weights_from_pipeline,
-    merge_lora_weights,
     validate_lora_file,
     log_system_info,
     parse_aspect_ratio,
     validate_dimensions,
     get_output_format_extension,
-    get_model_config_local,
-    download_custom_model_local,
     SDXL_MODEL_CACHE,
     REFINER_MODEL_CACHE,
     SAFETY_CACHE,
@@ -46,19 +48,28 @@ from utils import (
     SAFETY_URL
 )
 
-
 class KarrasDPM:
     def from_config(config):
         return DPMSolverMultistepScheduler.from_config(config, use_karras_sigmas=True)
 
+class KarrasDPMSingle:
+    def from_config(config):
+        return DPMSolverSinglestepScheduler.from_config(config, use_karras_sigmas=True)
 
+# All SDXL-supported schedulers
 SCHEDULERS = {
+    "Euler a": EulerAncestralDiscreteScheduler,  # Default - most popular for SDXL
+    "Euler": EulerDiscreteScheduler,
+    "Heun": HeunDiscreteScheduler,
+    "DPM++ 2M": DPMSolverMultistepScheduler,
+    "DPM++ 2M Karras": KarrasDPM,
+    "DPM++ SDE": DPMSolverSinglestepScheduler,
+    "DPM++ SDE Karras": KarrasDPMSingle,
     "DDIM": DDIMScheduler,
-    "DPMSolverMultistep": DPMSolverMultistepScheduler,
-    "HeunDiscrete": HeunDiscreteScheduler,
-    "KarrasDPM": KarrasDPM,
-    "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler,
-    "K_EULER": EulerDiscreteScheduler,
+    "DDPM": DDPMScheduler,
+    "DEIS": DEISMultistepScheduler,
+    "UniPC": UniPCMultistepScheduler,
+    "LMS": LMSDiscreteScheduler,
     "PNDM": PNDMScheduler,
 }
 
@@ -378,10 +389,10 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             
             # Load Animagine XL 4.0 as complete pipeline (has all components)
             self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-                'cagliostrolab/animagine-xl-4.0',
+                'drawhisper/animagine-xl-v4',
                 torch_dtype=torch.float16,
                 use_safetensors=True,
-                custom_pipeline="lpw_stable_diffusion_xl",
+                custom_pipeline="lpw_stable_diffusion_xl"
             ).to(self.device)
             
             self.current_model = "animagine-xl-4.0"
@@ -446,6 +457,10 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         self.refiner.to(self.device)
         print(f"Setup completed in {time.time() - start:.2f}s")
 
+    def load_image(self, path): 
+        shutil.copyfile(path, "/tmp/image.png")
+        return load_image("/tmp/image.png").convert("RGB")
+
     def switch_to_standard_sdxl(self):
         """Switch to standard SDXL for realistic content."""
         if self.current_model != "sdxl-base":
@@ -495,15 +510,13 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             
             try:
                 from diffusers import StableDiffusionXLPipeline
-
-                # animagine_cache = download_custom_model_local("animagine-xl-4.0")
                 
                 # Load Animagine XL 4.0 pipeline
                 self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-                    'cagliostrolab/animagine-xl-4.0',
+                    'drawhisper/animagine-xl-v4',
                     torch_dtype=torch.float16,
                     use_safetensors=True,
-                    custom_pipeline="lpw_stable_diffusion_xl",
+                    custom_pipeline="lpw_stable_diffusion_xl"
                 ).to(self.device)
                 
                 # Update other pipelines to use Animagine XL 4.0 components
@@ -556,6 +569,11 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             description="Text prompt for image generation",
             default="1girl, solo, ranni_the_witch, elden_ring, looking_at_viewer, witch_hat, blue_skin, doll_joints",
         ),
+        # SDXL-specific parameters
+        negative_prompt: str = Input(
+            description="Negative prompt - what you don't want in the image",
+            default="",
+        ),
         num_outputs: int = Input(
             description="Number of images to generate",
             ge=1,
@@ -578,8 +596,12 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             le=100,
             default=80,
         ),
-        image: Optional[Path] = Input(
+        image: Path = Input(
             description="Input image for image-to-image mode (supports PNG, JPG, WEBP).",
+            default=None,
+        ),
+        mask: Path = Input(
+            description="Input mask for inpainting mode (supports PNG, JPG, WEBP).",
             default=None,
         ),
         prompt_strength: float = Input(
@@ -588,36 +610,6 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             le=1.0,
             default=0.8,
         ),
-        seed: int = Input(
-            description="Random seed. Set for reproducible generation",
-            default=None,
-        ),
-        go_fast: bool = Input(
-            description="Run faster predictions with reduced quality",
-            default=False,
-        ),
-        guidance: float = Input(
-            description="Guidance for generated image. Lower values can give more realistic images. Good values to try are 2, 2.5, 3 and 3.5",
-            ge=1.0,
-            le=20.0,
-            default=7.5,
-        ),
-        megapixels: str = Input(
-            description="Approximate number of megapixels for generated image",
-            choices=["0.25", "0.5", "1", "2"],
-            default="1",
-        ),
-        num_inference_steps: int = Input(
-            description="Number of denoising steps. More steps generally give better quality but take longer",
-            ge=1,
-            le=50,
-            default=28,
-        ),
-        disable_safety_checker: bool = Input(
-            description="Disable safety checker for generated images",
-            default=False,
-        ),
-        
         # LoRA parameters (flux-compatible)
         lora_weights: str = Input(
             description="Primary LoRA weights. Supports Replicate models (owner/model), HuggingFace (huggingface.co/owner/model), CivitAI (civitai.com/models/id), and direct URLs",
@@ -647,16 +639,39 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             description="CivitAI API token for private models",
             default=None,
         ),
-        
-        # SDXL-specific parameters
-        negative_prompt: str = Input(
-            description="Negative prompt - what you don't want in the image",
-            default="",
+        seed: int = Input(
+            description="Random seed. Set for reproducible generation",
+            default=-1,
+        ),
+        go_fast: bool = Input(
+            description="Run faster predictions with reduced quality",
+            default=False,
+        ),
+        guidance: float = Input(
+            description="Guidance for generated image. Lower values can give more realistic images. Good values to try are 2, 2.5, 3 and 3.5",
+            ge=1.0,
+            le=20.0,
+            default=5,
+        ),
+        megapixels: str = Input(
+            description="Approximate number of megapixels for generated image",
+            choices=["0.25", "0.5", "1", "2"],
+            default="1",
+        ),
+        num_inference_steps: int = Input(
+            description="Number of denoising steps. More steps generally give better quality but take longer",
+            ge=1,
+            le=50,
+            default=28,
+        ),
+        disable_safety_checker: bool = Input(
+            description="Disable safety checker for generated images",
+            default=False,
         ),
         scheduler: str = Input(
             description="Sampling scheduler algorithm",
             choices=list(SCHEDULERS.keys()),
-            default="K_EULER",
+            default="Euler",
         ),
         cfg_scale: float = Input(
             description="Classifier-free guidance scale (same as guidance, kept for SDXL compatibility)",
@@ -668,12 +683,12 @@ class Predictor(BasePredictor, MultiLoRAMixin):
             description="Number of CLIP layers to skip (advanced parameter)",
             ge=0,
             le=2,
-            default=1,
+            default=0,
         ),
         refine: str = Input(
             description="Which refine style to use",
             choices=["no_refiner", "expert_ensemble_refiner", "base_image_refiner"],
-            default="base_image_refiner",
+            default="no_refiner",
         ),
         high_noise_frac: float = Input(
             description="For expert_ensemble_refiner, the fraction of noise to use",
@@ -683,7 +698,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         ),
         refine_steps: int = Input(
             description="For base_image_refiner, the number of steps to refine",
-            default=5,
+            default=None,
         ),
         apply_watermark: bool = Input(
             description="Apply watermark to generated images",
@@ -708,11 +723,15 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         print(f"Using aspect ratio {aspect_ratio} -> {width}x{height}")
         
         # Load input image if provided (for img2img mode)
+        if image and mask:
+            print(f"inpainting mode")
+            input_image = self.load_image(image)
+            mask_image = self.load_image(mask)
+
         if image:
-            input_image = load_image(image).convert("RGB")
-            print(f"Input image loaded with dimensions: {input_image.size[0]}x{input_image.size[1]}")
-            print(f"Output will be resized to: {width}x{height}")
-        
+            print(f"image to image mode")
+            input_image = self.load_image(image)
+
         # Apply go_fast optimizations
         if go_fast:
             num_inference_steps = max(10, num_inference_steps // 2)
@@ -768,15 +787,21 @@ class Predictor(BasePredictor, MultiLoRAMixin):
 
         # Determine pipeline mode
         sdxl_kwargs = {}
-        if image:
+        sdxl_kwargs["width"] = width
+        sdxl_kwargs["height"] = height
+        if image and mask:
+            print("inpainting mode")
+            sdxl_kwargs["image"] = input_image
+            sdxl_kwargs["mask_image"] = mask_image
+            sdxl_kwargs["strength"] = prompt_strength
+            pipe = self.inpaint_pipe
+        elif image:
             print("img2img mode")
             sdxl_kwargs["image"] = input_image
             sdxl_kwargs["strength"] = prompt_strength
             pipe = self.img2img_pipe
         else:
             print("txt2img mode")
-            sdxl_kwargs["width"] = width
-            sdxl_kwargs["height"] = height
             pipe = self.txt2img_pipe
 
         # Configure refiner
@@ -815,6 +840,7 @@ class Predictor(BasePredictor, MultiLoRAMixin):
         if self.loaded_loras:
             primary_scale = self.loaded_loras[0]["scale"]
             sdxl_kwargs["cross_attention_kwargs"] = {"scale": primary_scale}
+            
 
         # Handle CLIP skip (advanced parameter)
         if clip_skip > 0:
